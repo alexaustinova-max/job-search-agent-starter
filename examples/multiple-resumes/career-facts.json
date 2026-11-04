@@ -1,0 +1,29 @@
+{
+  "english_level": "B2",
+  "facts": [
+    {
+      "id": "demo_metrics",
+      "organization": "Вымышленная компания Альфа",
+      "text": "Анализ продуктовых метрик.",
+      "source": "cv/demo.txt",
+      "verified": true,
+      "capabilities": [
+        "product_analytics"
+      ],
+      "scope": "fictional",
+      "letter_text": "В вымышленной компании Альфа я анализировал продуктовые метрики и готовил аналитические материалы для обсуждения решений с командой."
+    },
+    {
+      "id": "demo_market",
+      "organization": "Вымышленная компания Бета",
+      "text": "Анализ потребностей рынка.",
+      "source": "cv/demo.txt",
+      "verified": true,
+      "capabilities": [
+        "market_analysis"
+      ],
+      "scope": "fictional",
+      "letter_text": "В вымышленной компании Бета я анализировал потребности рынка и систематизировал наблюдения, чтобы команда могла проверить исходные предположения."
+    }
+  ]
+}

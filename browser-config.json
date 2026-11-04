@@ -1,0 +1,7 @@
+{
+  "backend": "owned_playwright_chrome",
+  "profile_dir": "var/chrome-profile",
+  "node": "node",
+  "playwright_module": "playwright",
+  "headless": true
+}

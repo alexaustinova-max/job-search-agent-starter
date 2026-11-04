@@ -1,0 +1,76 @@
+{
+  "sources": [
+    {
+      "provider": "hh",
+      "board": "public",
+      "read_only": true,
+      "searches": [
+        {
+          "id": "MAIN-query",
+          "profile": "MAIN",
+          "text": "Демонстрационный аналитик"
+        },
+        {
+          "id": "SECOND-query",
+          "profile": "SECOND",
+          "text": "Демонстрационный координатор"
+        }
+      ],
+      "max_pages": 1,
+      "per_page": 10,
+      "detail_limit": 20,
+      "use_recent_details": true
+    }
+  ],
+  "filters": {
+    "min_monthly_rub": 60000,
+    "desired_monthly_rub": 100000,
+    "salary_basis": "NET",
+    "cities": [
+      "Демоград"
+    ],
+    "allowed_work_formats": [
+      "remote",
+      "on-site"
+    ],
+    "exclude_title_patterns": [],
+    "exclude_text_patterns": [],
+    "required_text_patterns": [],
+    "excluded_employers": []
+  },
+  "candidate": {
+    "name": "Демо Кандидат",
+    "email": "demo@example.invalid",
+    "english_level": "B2",
+    "facts_file": "career-facts.json",
+    "facts": [],
+    "cvs": {
+      "MAIN": "cv/demo.txt",
+      "SECOND": "cv/second.txt"
+    },
+    "profiles": {
+      "MAIN": {
+        "title": "Демонстрационный аналитик",
+        "title_patterns": [
+          "аналитик|analyst"
+        ],
+        "capabilities": [
+          "product_analytics",
+          "market_analysis"
+        ],
+        "priority": 0
+      },
+      "SECOND": {
+        "title": "Демонстрационный координатор",
+        "title_patterns": [
+          "координатор"
+        ],
+        "capabilities": [
+          "team_management"
+        ],
+        "priority": 1
+      }
+    },
+    "capability_patterns": {}
+  }
+}

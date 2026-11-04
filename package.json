@@ -1,0 +1,12 @@
+{
+  "name": "job-search-agent-starter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.56.1"
+  },
+  "scripts": {
+    "test": "node --test tests/browser.test.mjs"
+  }
+}

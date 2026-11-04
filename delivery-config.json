@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "delivery_approval": null,
+  "recipient": null,
+  "recipient_confirmed": false,
+  "sender": null,
+  "smtp_host": null,
+  "smtp_port": 465,
+  "smtp_user": null,
+  "tls": "implicit_ssl",
+  "transport": "smtp",
+  "apps_script_url": null,
+  "apps_script_recipient": null,
+  "apps_script_test_confirmed": false
+}

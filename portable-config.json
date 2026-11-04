@@ -1,0 +1,14 @@
+{
+  "installation_id": null,
+  "profile_confirmed": false,
+  "timezone": "UTC",
+  "hh_enabled": false,
+  "browser_enabled": false,
+  "ai_enabled": false,
+  "dispatch_enabled": false,
+  "mail_enabled": false,
+  "max_vacancies": 20,
+  "max_search_requests": 2,
+  "max_applications_per_day": 5,
+  "daily_time": "09:00"
+}
