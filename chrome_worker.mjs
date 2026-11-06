@@ -9,7 +9,12 @@ const require=createRequire(import.meta.url);
 let context=null,playwright=null,windowId=null;
 const pages=new Map();
 let statusFile=null;
-function stage(phase){if(statusFile)writeFileSync(statusFile,JSON.stringify({phase,time:new Date().toISOString()}),{mode:0o600});}
+function stage(phase){
+  // Diagnostic output is not a browser safety gate. A transient filesystem error
+  // must not abort every remaining vacancy before its form can be inspected.
+  if(statusFile)try{writeFileSync(statusFile,JSON.stringify({phase,time:new Date().toISOString()}),{mode:0o600});}
+  catch(_){} // No field values, credentials or exception prose are logged.
+}
 async function boundedRead(read,ms=10000){
   let timer;try{return await Promise.race([read,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('HH_read_timeout_no_page_action')),ms);})]);}
   finally{clearTimeout(timer);}
@@ -59,7 +64,10 @@ async function action(m){
       evaluate:(...args)=>page.evaluate(...args),domSnapshot:()=>page.locator('body').innerText({timeout:7000}),
       locator:selector=>{const locator=page.locator(selector);return {
         waitFor:({state,timeoutMs})=>locator.waitFor({state,timeout:timeoutMs}),
-        getAttribute:name=>locator.getAttribute(name),click:()=>locator.click({timeout:7000})};}}};
+        getAttribute:name=>locator.getAttribute(name),click:async()=>{try{return await locator.click({timeout:7000});}
+          catch(error){const message=String(error.message||'');
+            const cause=message.includes('intercepts pointer events')?'pointer_intercepted':message.includes('not visible')?'not_visible':message.includes('not enabled')?'disabled':message.includes('not attached')?'detached':'not_actionable_within_bound';
+            throw Error('HH_history_control_unavailable: '+selector+'; '+cause);}}};}}};
     return await verifyHhHistory(facade,m.ids);
   }
   if(m.op==='js'){stage('evaluate');return await boundedRead(page.evaluate(m.code),15000);}

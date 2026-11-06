@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unattended HH cycle; dispatch stays gated by real control E2E, quality and explicit enablement."""
 import argparse
+import fcntl
 from collections import Counter
 from contextlib import redirect_stdout,closing
 from datetime import datetime
@@ -84,6 +85,9 @@ def presentation_context(root,report):
         db.row_factory=sqlite3.Row
         has_meta=bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone())
         for item in report.get('items',[]):
+            if item.get('letter'):
+                # Presentation flags are never authority after a policy/CV/fact change.
+                item['letter'].update(editorial_checks_passed=False,editorial_approved=False,submission_allowed=False)
             row=db.execute('SELECT data FROM jobs WHERE key=?',('hh:public:'+item['hh_id'],)).fetchone()
             if not row:continue
             job=json.loads(row[0]);fit=item.get('fit_assessment') or fits.get(item['hh_id'],{})
@@ -94,9 +98,18 @@ def presentation_context(root,report):
                     'letter':letter.get('body',''),'letter_fact_ids':letter.get('fact_ids',[]),
                     'letter_sha256':p.digest(letter.get('body','')),'context_fingerprint':saved.get('fingerprint'),
                     'model':'reviewed_letter','test_only':False}
-                if letter and not ab.letter_readiness(state,checked,root):
+                letter_issues=ab.letter_readiness(state,checked,root) if letter else []
+                if letter and not letter_issues:
                     item['letter']={**letter,'editorial_checks_passed':True,'editorial_approved':True,
                         'approval_kind':saved.get('editorial_review',{}).get('approved_by')}
+                elif (letter.get('provenance')=='openai_complete_letter_needs_review'
+                      and not any(i in letter_issues for i in ('letter_context_not_current','cv_version_not_current','hh_cv_version_or_mapping_not_current'))):
+                    item['letter']={**letter,'editorial_checks_passed':False,'editorial_approved':False,
+                        'review_reasons':saved.get('editorial_review',{}).get('issues',letter_issues)}
+                else:
+                    # Do not display a stale/local fallback as the new AI letter.
+                    # Its original text remains in SQLite/history, never deleted.
+                    item['letter']=None
             item.setdefault('fit_assessment',fit)
             item['salary']=salary_label(job)
             fingerprint=p.digest([daily.material(job),item['cv'].get('hh_version'),base])
@@ -107,7 +120,7 @@ def presentation_context(root,report):
             experience=fit.get('experience','needs_data');career=fit.get('career','needs_scope')
             ids=list(dict.fromkeys(fid for e in fit.get('evidence',[]) for fid in e['fact_ids']))
             ai_checked=bool(item.get('letter',{}).get('editorial_checks_passed')) if item.get('letter') else False
-            ai_review=bool(item.get('letter',{}).get('provenance')=='openai_source_cited_needs_review') if item.get('letter') else False
+            ai_review=bool(item.get('letter',{}).get('provenance') in ('openai_source_cited_needs_review','openai_complete_letter_needs_review')) if item.get('letter') else False
             item['display']={
                 'group':review.get('group','priority' if experience=='high' and career=='high' else 'consider'),
                 'interest':review.get('interest',LABELS.get(item['priority'],'Смежная роль')+'. '+ '; '.join(fit.get('tasks',[])[:2])),
@@ -278,15 +291,18 @@ def runtime_check(root=p.ROOT):
     result['ready']=not result['errors'];daily.write_json(root/'var/daily-runtime-status.json',result);return result
 
 
-def finish_daily(root,report,*,offline=False,ai_already_run=False):
+def finish_daily(root,report,*,offline=False,ai_already_run=False,reuse_prepared=False):
     """Same scheduled command: optional editorial gate -> mail preview/delivery."""
     root=Path(root);cfg=letters.settings(root)
     summary={'offline':offline,'paid_calls_this_stage':0,'ai_status':'disabled','applications_sent':0}
     dispatchpath=root/'dispatch-config.json'
     dispatchcfg=json.loads(dispatchpath.read_text()) if dispatchpath.exists() else {}
+    if dispatchcfg.get('paused'):
+        ai_already_run=True  # Keep search/context analysis; no legacy letter fallback during quality review.
+        summary.update(dispatch_status='paused_by_user',ai_status='paused_for_letter_quality_review')
     if cfg.get('runtime_preflight_enabled') and not offline:
         summary['runtime']=runtime_check(root)
-    if dispatchcfg.get('enabled') and not offline:
+    if dispatchcfg.get('enabled') and not dispatchcfg.get('paused') and not offline:
         ai_already_run=True  # Never fall through to the older second editorial path.
         with closing(sqlite3.connect((root/'var/jobs.sqlite3').as_uri()+'?mode=ro',uri=True)) as db:
             db.row_factory=sqlite3.Row;state=type('ReadOnlyState',(),{'db':db})()
@@ -300,14 +316,17 @@ def finish_daily(root,report,*,offline=False,ai_already_run=False):
             summary['dispatch_status']='blocked_HH_daily_cycle_failed'
         else:
             try:
-                editorial=ab.prepare_automatic_queue(root)
+                # A wake/recovery resumes saved quality-checked letters; do not spend
+                # again or repeat the completed search just to recover browser work.
+                editorial,result=dispatch_batches(root,reuse_prepared=report.get('editorial_stage') if reuse_prepared else None)
+                summary['ai_status']='saved_preparation_reused' if reuse_prepared else 'automatic_preparation_completed'
                 ai_already_run=True
                 verified=set(editorial.get('verified_queue_ids',[]))
+                matched=set(editorial.get('matched_queue_ids',verified))
                 candidates={e['hh_id']:e for e in ab.queue_candidates(root)}
-                report['items']=[e for vid,e in candidates.items() if vid in verified]
-                report['counts']['carried_forward_candidates']=len(verified)
+                report['items']=[e for vid,e in candidates.items() if vid in matched]
+                report['counts']['carried_forward_candidates']=len(matched)
                 presentation_context(root,report)
-                result=ab.automatic_dispatch(root)
                 summary.update(dispatch_status='completed',applications_sent=result['confirmed'])
                 report.update(autonomous_dispatch=result,applications_sent=result['confirmed'],editorial_stage=editorial)
                 publish_priorities(root,report);record(root,report)
@@ -319,7 +338,7 @@ def finish_daily(root,report,*,offline=False,ai_already_run=False):
         try:
             plan=ab.prepare_automatic_queue(root,plan_only=True)
             candidates={e['hh_id']:e for e in ab.queue_candidates(root)}
-            report['items']=[e for vid,e in candidates.items() if vid in set(plan['verified_queue_ids'])]
+            report['items']=[e for vid,e in candidates.items() if vid in set(plan.get('matched_queue_ids',plan['verified_queue_ids']))]
             report['counts']['carried_forward_candidates']=len(report['items'])
             report['queue_plan']=plan;presentation_context(root,report)
             summary['queue_plan']={k:plan[k] for k in ('eligible_queued','reused_quality_letters','letters_waiting_for_AI','preparation_exclusions')}
@@ -342,18 +361,9 @@ def finish_daily(root,report,*,offline=False,ai_already_run=False):
                 daily.write_json(root/'var/daily-editorial-plan.json',plan)
                 summary['editorial_plan']={k:plan[k] for k in ('planned_calls','cost_upper_bound_usd','within_configured_daily_limits','within_configured_monthly_limit')}
             except Exception:summary['editorial_plan']={'status':'saved_context_requires_review'}
-    with closing(sqlite3.connect((root/'var/jobs.sqlite3').as_uri()+'?mode=ro',uri=True)) as db:
-        db.row_factory=sqlite3.Row;state=type('ReadOnlyState',(),{'db':db})()
-        report['ai_usage']=letters.spending_totals(state)
-        sent_ids=ab.daily_send_ids(state,report['ai_usage']['date_moscow']);report['sent_today']=[]
-        for row in db.execute("SELECT job_key,payload,receipt FROM applications WHERE state='confirmed'"):
-            vid=row['job_key'].removeprefix('hh:public:')
-            if vid not in sent_ids:continue
-            payload=json.loads(row['payload']);receipt=json.loads(row['receipt'])
-            report['sent_today'].append({'hh_id':vid,'status':'confirmed','cv':payload['profile'],
-                'letter':payload.get('body',''),'answers':receipt.get('answers',payload.get('answers',[])),'receipt':receipt})
-    report['applications_sent']=len(report['sent_today']);report['daily_dispatch_enabled']=bool(dispatchcfg.get('enabled') and recurring_ai_approved(cfg))
-    report['ai_calls']=report['ai_usage']['day']['calls'];report['ai_cost_usd']=report['ai_usage']['day']['actual_cost_usd']
+    refresh_dispatch_report(root,report,notify=not offline and __import__('portable_runtime').settings(root).get('browser_enabled',False))
+    report['daily_dispatch_enabled']=bool(dispatchcfg.get('enabled') and recurring_ai_approved(cfg))
+    publish_quality_review(root,report)
     publish_priorities(root,report);record(root,report)
     summary['ai_usage']=report['ai_usage']
     try:summary['mail']=delivery.deliver(root,report,offline=offline)
@@ -365,7 +375,7 @@ def finish_daily(root,report,*,offline=False,ai_already_run=False):
 
 
 def run(root=p.ROOT,*,trigger='manual',force=False):
-    root=Path(root);folder=root/'var';day=datetime.now(ZoneInfo(__import__('portable_runtime').timezone())).date().isoformat()
+    root=Path(root);folder=root/'var';day=datetime.now(ZoneInfo(__import__('portable_runtime').timezone(root))).date().isoformat()
     cfg=json.loads((root/'pipeline-config.hh.json').read_text());base=json.loads((root/cfg['candidate']['facts_file']).read_text());facts={f['id']:f for f in base['facts'] if f.get('verified')};cvs={pr:p.cv_choice(pr,cfg['candidate'],root) for pr in cfg['candidate'].get('cvs',{})}
     input_hash=p.digest([VERSION,daily.DAILY_CYCLE_VERSION,ab.CONTENT_POLICY,cfg,base,cvs])
     report={'run_id':uuid.uuid4().hex,'generated_at':p.now(),'date_moscow':day,'trigger':trigger,'pid':os.getpid(),'parent_pid':os.getppid(),'python':sys.executable,'input_hash':input_hash,'status':'blocked','items':[],'important_exceptions':[],'applications_sent':0,'ai_calls':0,'ai_cost_usd':0,'cache_hit':False}
@@ -392,7 +402,6 @@ def run(root=p.ROOT,*,trigger='manual',force=False):
             for entry in sorted(entries,key=lambda e:e.get('priority',e.get('fit',{}).get('priority',9))):
                 vid=entry['hh_id'];key='hh:public:'+vid
                 if vid in seen:continue
-                if len(report['items'])>=__import__('portable_runtime').settings(root)['max_applications_per_day']:break
                 seen.add(vid);row=state.db.execute('SELECT * FROM jobs WHERE key=?',(key,)).fetchone()
                 if not row or daily.exclusion(state,row,held):continue
                 job=json.loads(row['data']);profile=entry['cv']['profile'] if isinstance(entry['cv'],dict) else entry['cv'];cv=cvs[profile];fit=entry.get('fit',entry)
@@ -454,23 +463,240 @@ def risk_text(text):
             'remote_from_russia_requires_confirmation':'Допустимая география удалённой работы требует подтверждения.'}.get(text,text)
 
 
+
+
+def refresh_dispatch_report(root,report,*,notify=False):
+    """Read actual history and budget only; no HH, AI, mail or repeated dispatch."""
+    root=Path(root);state=p.State(root/'var/jobs.sqlite3')
+    try:
+        report['ai_usage']=letters.spending_totals(state);report['budget_forecast']=letters.budget_forecast(state,root)
+        report['budget_forecast']['day_remaining_usd']=max(0,letters.settings(root)['max_cost_usd_per_day']-report['ai_usage']['day']['cost_usd'])
+        report['question_queue']=ab.publish_question_queue(state,root,notify=notify)
+        sent_ids=ab.daily_send_ids(state,report['ai_usage']['date_moscow']);report['sent_today']=[]
+        for row in state.db.execute("SELECT a.job_key,a.payload,a.receipt,j.data FROM applications a LEFT JOIN jobs j ON j.key=a.job_key WHERE a.state='confirmed'"):
+            vid=row['job_key'].removeprefix('hh:public:')
+            if vid not in sent_ids:continue
+            payload=json.loads(row['payload']);receipt=json.loads(row['receipt']);job=json.loads(row['data']) if row['data'] else {}
+            report['sent_today'].append({'hh_id':vid,'status':'confirmed','cv':payload['profile'],'employer':job.get('employer'),'title':job.get('title'),
+                'letter':payload.get('body',''),'answers':receipt.get('answers',payload.get('answers',[])),'receipt':receipt})
+        forecast=report['budget_forecast'];month=report['ai_usage']['date_moscow'][:7];notice_key='application:monthly-cost-notice:'+month
+        if notify and forecast['approaching_month_limit'] and not daily.setting(state,notice_key):
+            try:
+                result=subprocess.run(['/usr/bin/osascript','-e','display notification "Месячный бюджет OpenAI близок к лимиту. Прогноз оставшихся откликов — в ежедневном отчете; увеличение требует согласования." with title "Job Search Agent"'],capture_output=True,timeout=10)
+                if result.returncode==0:daily.remember(state,notice_key,{'at':p.now()});state.db.commit()
+            except (OSError,subprocess.TimeoutExpired):pass
+    finally:state.close()
+    report['applications_sent']=len(report['sent_today']);report['ai_calls']=report['ai_usage']['day']['calls'];report['ai_cost_usd']=report['ai_usage']['day']['actual_cost_usd']
+    return report
+
+
+def dispatch_batches(root,*,reuse_prepared=None):
+    """Existing preparation/dispatch, sequential batches; ordinary exceptions never end the day."""
+    root=Path(root);size=letters.settings(root)['batch_size'];recovery=ab.recover_preclick_aborts(root);entries=ab.queue_candidates(root)
+    groups=[{e['hh_id'] for e in entries[i:i+size]} for i in range(0,len(entries),size)] or [set()]
+    if reuse_prepared is not None:
+        done=set(reuse_prepared.get('matched_queue_ids',reuse_prepared.get('verified_queue_ids',[])))
+        rest=[e for e in entries if e['hh_id'] not in done]
+        groups=[set(reuse_prepared.get('verified_queue_ids',[]))]+[{e['hh_id'] for e in rest[i:i+size]} for i in range(0,len(rest),size)]
+    combined={'results':[],'drafts':[],'verified_queue_ids':[],'matched_queue_ids':[],'generated_letter_ids':[],
+        'independently_verified_ids':[],'preparation_exclusions':[],'exceptions':{}}
+    dispatched={'outcomes':[],'excluded':[],'confirmed':0,'applications_sent':0};processed=[];stop=None
+    for ids in groups:
+        with closing(sqlite3.connect((root/'var/jobs.sqlite3').as_uri()+'?mode=ro',uri=True)) as db:
+            db.row_factory=sqlite3.Row;state=type('RO',(),{'db':db})();day=datetime.now(ZoneInfo(__import__('portable_runtime').timezone(root))).date().isoformat()
+            occupied=set(daily.setting(state,'dispatch:day:'+day,{'slots':{}})['slots'])|ab.daily_send_ids(state,day)
+        if len(occupied)>=min(__import__('portable_runtime').settings(root)['max_applications_per_day'],json.loads((root/'dispatch-config.json').read_text())['max_confirmed_per_day']):stop='daily_slot_limit_reached';break
+        try:
+            if reuse_prepared is not None:
+                part=reuse_prepared;ids=set(part.get('verified_queue_ids',[]));reuse_prepared=None
+            else:part=ab.prepare_automatic_queue(root,ids=ids)
+            processed.extend(sorted(ids))
+            for k in combined:
+                if k=='exceptions':combined[k].update(part.get(k,{}))
+                else:combined[k].extend(part.get(k,[]))
+            result=ab.automatic_dispatch(root,ids=set(part.get('verified_queue_ids',[])))
+            dispatched['outcomes'].extend(result.get('outcomes',[]));dispatched['excluded'].extend(result.get('excluded',[]))
+            dispatched['confirmed']+=result.get('confirmed',0);dispatched['applications_sent']=dispatched['confirmed']
+            if any(any(marker in o.get('reason','') for marker in ('captcha','protection','cooldown','authorized HH session','agent_browser_transport')) for o in result.get('outcomes',[])):
+                stop='browser_protection_or_session_requires_attention';break
+        except Exception as exc:
+            combined['preparation_exclusions'].extend({'hh_id':vid,'reason':'batch_stage_error:'+type(exc).__name__} for vid in ids)
+            if any(t in str(exc) for t in ('already running','already_running','paused_by_user','not_enabled')):stop=type(exc).__name__;break
+    combined['processed_ids']=list(dict.fromkeys(processed));combined['stop_reason']=stop or 'available_queue_exhausted'
+    combined['preclick_recovery']=recovery
+    for k in ('verified_queue_ids','matched_queue_ids','generated_letter_ids','independently_verified_ids'):combined[k]=list(dict.fromkeys(combined[k]))
+    return combined,dispatched
+
+
+def publish_quality_review(root,report):
+    """Deterministic evidence report for the user; never a send approval or an AI task."""
+    root=Path(root);path=root/'var/jobs.sqlite3';facts_path=root/'career-facts.json'
+    facts={f['id']:f for f in json.loads(facts_path.read_text())['facts']} if facts_path.exists() else {}
+    editorial=report.get('editorial_stage',{});dispatch=report.get('autonomous_dispatch',{})
+    by_id={str(i['hh_id']):dict(i) for i in report.get('items',[])}
+    for row in dispatch.get('excluded',[])+editorial.get('preparation_exclusions',[])+dispatch.get('outcomes',[])+report.get('sent_today',[]):
+        vid=str(row['hh_id']);by_id[vid]={**by_id.get(vid,{}),**row}
+    day=report['date_moscow'];counts=report.get('counts',{});confirmed=report.get('applications_sent',0)
+    report['decision_funnel']={'new':counts.get('new_vacancies',0),'full_descriptions':counts.get('fresh_verified_vacancies',counts.get('evaluated',0)),
+        'considered':len(by_id),'eligible':len(set(editorial.get('matched_queue_ids',[]))),
+        'letters_prepared':len(set(editorial.get('generated_letter_ids',[]))),
+        'letters_verified':len(set(editorial.get('independently_verified_ids',[]))),
+        'confirmed':confirmed,'waiting_or_blocked':sum(x.get('status')!='confirmed' for x in by_id.values()),
+        'hard_daily_limit':min(__import__('portable_runtime').settings(root)['max_applications_per_day'],json.loads((root/'dispatch-config.json').read_text())['max_confirmed_per_day']),'stop_reason':editorial.get('stop_reason','scoped_control_run')}
+    safe=lambda value:delivery.safe_text(str(value)).replace('\r',' ').replace('\x00','')
+    cell=lambda value:safe(value).replace('|','/').replace('\n',' ')
+    lines=['# Job Search Agent · Проверка качества · '+day,'','Сформировано: '+safe(p.now()),
+        'Запуск: '+safe(report.get('generated_at','не указан')),'','## Воронка',
+        *['- '+key+': '+safe(value) for key,value in report['decision_funnel'].items()],
+        '', 'Количество не заменяет проверку качества; причины приведены по каждой рассмотренной вакансии.',
+        '', '## Рассмотренные вакансии','', '| HH ID | Компания и должность | CV | Решение / причина |','|---|---|---|---|']
+    jobs={};reviews={};applications={};checks={}
+    if path.exists():
+        with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)) as db:
+            db.row_factory=sqlite3.Row
+            for vid,item in by_id.items():
+                row=db.execute('SELECT data FROM jobs WHERE key=?',('hh:public:'+vid,)).fetchone();job=json.loads(row['data']) if row else {};jobs[vid]=job
+                row=db.execute('SELECT state,payload,receipt FROM applications WHERE job_key=?',('hh:public:'+vid,)).fetchone()
+                if row:applications[vid]={'state':row['state'],'payload':json.loads(row['payload']),'receipt':json.loads(row['receipt']) if row['receipt'] else {}}
+                saved=daily.setting(type('RO',(),{'db':db})(),'daily:letter:hh:public:'+vid,{})
+                body=item.get('letter') or applications.get(vid,{}).get('payload',{}).get('body') or saved.get('letter',{}).get('body','')
+                if isinstance(body,dict):body=body.get('body','')
+                versions=[json.loads(r['value']) for r in db.execute('SELECT value FROM meta WHERE key LIKE ?',('daily:llm-letter:real:'+vid+':%',))]
+                matching=[r for r in versions if r.get('letter_body')==body]
+                if matching:reviews[vid]=next((r for r in reversed(matching) if r.get('quality_passed')),matching[-1])
+                item['_body']=body;checks[vid]=ab.mandatory_screen(job.get('description',''),facts)
+    for vid,item in by_id.items():
+        job=jobs.get(vid,{});cv=item.get('cv') or applications.get(vid,{}).get('payload',{}).get('profile','—');cv=cv.get('profile','—') if isinstance(cv,dict) else cv
+        item['_profile']=cv
+        lines.append('| ['+vid+'](https://hh.ru/vacancy/'+vid+') | '+cell(job.get('employer',item.get('employer',''))+' — '+job.get('title',item.get('title','')))+' | '+cell(cv)+' | '+cell(item.get('reason') or item.get('status') or ('Письмо проверено; форма отдельно' if reviews.get(vid,{}).get('quality_passed') else 'Не допущено'))+' |')
+    lines+=['','## Все подтвержденные отклики','']
+    sent=[(vid,i) for vid,i in by_id.items() if i.get('status')=='confirmed']
+    if not sent:lines+=['Подтвержденных отправок в этом отчете нет.']
+    for vid,item in sent:
+        job=jobs.get(vid,{});lines+=['- '+safe(job.get('employer',''))+' — '+safe(job.get('title',''))+'; HH '+vid+'; CV '+safe(item['_profile'])+'; confirmed; https://hh.ru/vacancy/'+vid]
+    # Prefer different profiles; include disputed decisions even if none were sent.
+    samples=[];profiles=set()
+    for vid,item in sorted(by_id.items(),key=lambda pair:pair[1].get('status')!='confirmed'):
+        if item.get('_profile') not in profiles:samples.append(vid);profiles.add(item.get('_profile'))
+        if len(samples)>=3:break
+    for vid in by_id:
+        if vid not in samples:samples.append(vid)
+        if len(samples)>=5:break
+    lines+=['','## Подробные примеры','']
+    for vid in samples[:5]:
+        item=by_id[vid];job=jobs.get(vid,{});review=reviews.get(vid,{});screen=checks.get(vid,{})
+        lines+=['### '+safe(job.get('employer',''))+' · '+safe(job.get('title',''))+' · HH '+vid,'','https://hh.ru/vacancy/'+vid,
+            '','CV: '+safe(item['_profile'])+'. Выбор соответствует сохраненному карьерному профилю; допуск требует актуальной проверки связки CV/вакансия/письмо.',
+            '', 'Задачи:']+['- '+safe(t) for t in ab.employer_tasks(job.get('description',''))[:3]]
+        lines+=['','Обязательные требования и подтверждение:']
+        for requirement in screen.get('requirements',[])[:12]:lines+=['- «'+safe(requirement['quote'])+'» — '+safe(requirement['status'])+(' / '+safe(requirement['reason']) if requirement.get('reason') else '')]
+        lines+=['','Использованные факты:']
+        for fid in review.get('fact_ids',[]):
+            if fid in facts:lines+=['- `'+fid+'`: '+safe(facts[fid]['text'])]
+        lines+=['','Полный текст письма:', '',safe(item.get('_body') or 'Письмо не подготовлено / не допущено.'),
+            '', 'Независимая проверка: '+safe({'passed':review.get('quality_passed',False),'coverage_complete':review.get('quality_review',{}).get('coverage_complete'),
+            'policy':review.get('quality_policy_revision'),'model':review.get('model'),'issues':review.get('editorial_issues',[]),'notes':review.get('quality_review',{}).get('style_notes',[])}),
+            '', 'Фактический статус: '+safe(item.get('status', 'not_submitted'))+'. '+safe(item.get('reason',''))]
+        receipt=applications.get(vid,{}).get('receipt',{})
+        if item.get('status')=='confirmed':lines+=['Подтверждение HH: '+safe({k:receipt.get(k) for k in ('history_verified','vacancy_id','resume_id','hh_status','letter_sha256','verified_at')})]
+    lines+=['','## Показательные исключения','']
+    for vid,item in [(v,i) for v,i in by_id.items() if i.get('status')!='confirmed'][:3]:
+        lines+=['- HH '+vid+': '+safe(item.get('reason') or item.get('status','Не допущено'))]
+        lines+=['  - Цитата: «'+safe(q['quote'])+'»' for q in checks.get(vid,{}).get('blocking',[])[:2]]
+    usage=report.get('ai_usage',{});cfg=letters.settings(root)
+    remaining_day=max(0,cfg['max_cost_usd_per_day']-usage.get('day',{}).get('cost_usd',0));remaining_month=max(0,cfg['max_cost_usd_per_month']-usage.get('month',{}).get('cost_usd',0))
+    lines+=['','## Расходы и ограничения','',safe(usage),f'Остаток: ${remaining_day:.6f} за сутки; ${remaining_month:.6f} за месяц.',
+        'Лимит откликов задается конфигурацией; он не является обязательной квотой. Неизвестные вопросы, тесты, обязательные неподтвержденные квалификации и неопределенные отправки не обходятся.']
+    text='\n'.join(lines)+'\n';report['quality_review_markdown']=text
+    write_text(root/'var/agent-quality-review.md',text);write_text(root/'var/daily-digests'/day/'agent-quality-review.md',text)
+    return text
+
+
+def execute_daily(root=p.ROOT,*,trigger='manual',force=False,edit_letters=False,now=None,resume_questions_only=False):
+    """Whole-cycle singleton and durable daily completion gate for login/wake catch-up."""
+    root=Path(root);folder=root/'var';folder.mkdir(parents=True,exist_ok=True)
+    current=now or datetime.now(ZoneInfo(__import__('portable_runtime').timezone(root)));day=current.date().isoformat()
+    dispatch_config=json.loads((root/'dispatch-config.json').read_text())
+    due=__import__('portable_runtime').settings(root)['daily_time']
+    if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',due):raise ValueError('invalid_daily_time')
+    due_hour,due_minute=map(int,due.split(':'))
+    if trigger=='launchd' and (current.hour,current.minute)<(due_hour,due_minute):
+        return {'status':'not_due','date_moscow':day,'applications_sent':0}
+    with (folder/'.daily-cycle.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:return {'status':'already_running','date_moscow':day,'applications_sent':0}
+        key='daily:execution:'+day
+        state=p.State(folder/'jobs.sqlite3')
+        try:
+            previous=daily.setting(state,key,{})
+            resume_only=resume_questions_only or previous.get('status')=='completed' and not force
+            has_answers=bool(ab.pending_question_resumes(state,root)) if resume_only else False
+            if not resume_only:
+                daily.remember(state,key,{'status':'running','started_at':p.now(),'pid':os.getpid()})
+                state.event('daily_execution_started',date_moscow=day,trigger=trigger,pid=os.getpid());state.db.commit()
+        finally:state.close()
+        if resume_only:
+            if not has_answers:return {'status':'already_completed','date_moscow':day,'applications_sent':previous.get('applications_sent',0)}
+            resumed=ab.resume_question_queue(root)
+            saved=folder/'daily-digest.json';report=json.loads(saved.read_text()) if saved.exists() else {}
+            if report.get('date_moscow')==day:
+                resumed_dispatch=resumed.get('autonomous_dispatch')
+                if resumed_dispatch:
+                    prior=report.get('autonomous_dispatch',{});by_id={x['hh_id']:x for x in prior.get('outcomes',[])}
+                    by_id.update({x['hh_id']:x for x in resumed_dispatch.get('outcomes',[])})
+                    report['autonomous_dispatch']={**prior,'outcomes':list(by_id.values())}
+                refresh_dispatch_report(root,report,notify=True);publish_priorities(root,report);record(root,report)
+            return {**resumed,'date_moscow':day,'daily_history_preserved':True}
+        saved=folder/'daily-digest.json';report=json.loads(saved.read_text()) if saved.exists() else {}
+        resume=not force and report.get('date_moscow')==day and report.get('status') in ('completed','partial')
+        if resume:
+            report.update(source_run_id=report.get('source_run_id',report['run_id']),run_id=uuid.uuid4().hex,
+                generated_at=p.now(),trigger=trigger,pid=os.getpid(),parent_pid=os.getppid(),
+                hh_requests_this_run=0,cache_hit=True,resumed_saved_cycle=True)
+        else:report=run(root,trigger=trigger,force=force)
+        if edit_letters and report['items']:
+            report=edit_digest_letters(root,report);record(root,report)
+        summary=finish_daily(root,report,ai_already_run=edit_letters,
+            reuse_prepared=bool(resume and report.get('editorial_stage',{}).get('verified_queue_ids')))
+        outcomes=report.get('autonomous_dispatch',{}).get('outcomes',[])
+        technical=any(any(marker in item.get('reason','') for marker in
+            ('agent_browser','HH_history_','HH UI did not reach','complete_HH_history_not_verified')) for item in outcomes)
+        dispatch_enabled=json.loads((root/'dispatch-config.json').read_text()).get('enabled',False)
+        if not dispatch_enabled:technical=False
+        completed=(report['status'] in ('completed','partial') and not technical
+            and (not dispatch_enabled or summary.get('dispatch_status')=='completed'))
+        result={'status':'completed' if completed else 'retryable_failure','date_moscow':day,
+            'run_id':report['run_id'],'source_status':report['status'],'resumed_saved_cycle':resume,
+            'counts':report.get('counts',{}),'hh_requests_this_run':report.get('hh_requests_this_run',0),
+            'applications_sent':report.get('applications_sent',0),'dispatch_status':summary.get('dispatch_status'),
+            'mail':summary.get('mail'),'finished_at':p.now()}
+        state=p.State(folder/'jobs.sqlite3')
+        try:
+            daily.remember(state,key,result);state.event('daily_execution_finished',date_moscow=day,
+                status=result['status'],applications_sent=result['applications_sent'],run_id=report['run_id']);state.db.commit()
+        finally:state.close()
+        return result
+
+
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--trigger',choices=('manual','launchd'),default='manual');parser.add_argument('--force',action='store_true',help='Explicitly run another fresh incremental cycle today')
-    parser.add_argument('--edit-letters',action='store_true',help='Optional one-batch OpenAI editorial stage; separate configured spending approval required. Off in launchd.')
-    parser.add_argument('--preview-delivery',action='store_true',help='Offline end-stage replay of saved digest; no HH, SMTP, secrets or paid calls')
-    parser.add_argument('--check-runtime',action='store_true',help='Check Keychain/TLS/native browser runtime and saved control receipt; no HH or paid calls')
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--trigger',choices=('manual','launchd'),default='manual')
+    parser.add_argument('--force',action='store_true')
+    parser.add_argument('--edit-letters',action='store_true')
+    parser.add_argument('--resume-questions',action='store_true',help='Resume explicitly confirmed pending answers only; no new daily search')
+    parser.add_argument('--preview-delivery',action='store_true',help='Offline render of saved report; no external actions')
+    parser.add_argument('--check-runtime',action='store_true')
     args=parser.parse_args();os.umask(0o077)
-    if args.check_runtime:
-        result=runtime_check();print(json.dumps(result,ensure_ascii=False));raise SystemExit(0 if result['ready'] else 1)
     if args.preview_delivery:
-        if args.edit_letters or args.force:parser.error('offline mail preview cannot enable paid AI or search')
+        if args.edit_letters or args.force or args.resume_questions:parser.error('offline preview cannot enable work')
         report=json.loads((p.ROOT/'var/daily-digest.json').read_text())
-        print(json.dumps(finish_daily(p.ROOT,report,offline=True),ensure_ascii=False));raise SystemExit(0)
-    if args.edit_letters:
-        cfg=letters.settings(p.ROOT)
-        if not recurring_ai_approved(cfg):parser.error('paid LLM disabled: separate user spending approval required')
-    result=run(trigger=args.trigger,force=args.force)
-    if args.edit_letters and result['items']:
-        result=edit_digest_letters(p.ROOT,result);record(p.ROOT,result)
-    finish_daily(p.ROOT,result,ai_already_run=args.edit_letters)
-    print(json.dumps({k:result.get(k) for k in ('run_id','status','cache_hit','trigger','pid','parent_pid','counts','hh_requests_this_run','applications_sent','ai_calls')},ensure_ascii=False));raise SystemExit(0 if result['status']=='completed' else 1)
+        result=finish_daily(p.ROOT,report,offline=True)
+    elif args.check_runtime:
+        __import__('portable_runtime').identity(p.ROOT)
+        result=runtime_check()
+    else:
+        __import__('portable_runtime').require(p.ROOT,'hh')
+        if args.edit_letters:__import__('portable_runtime').require(p.ROOT,'ai')
+        result=execute_daily(trigger=args.trigger,force=args.force,edit_letters=args.edit_letters,resume_questions_only=args.resume_questions)
+    print(json.dumps(result,ensure_ascii=False))
+    raise SystemExit(1 if result.get('status') in ('retryable_failure','blocked') else 0)

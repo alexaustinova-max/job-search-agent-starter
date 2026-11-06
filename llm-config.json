@@ -15,5 +15,6 @@
   "editorial_mode": "exact_fragments",
   "recurring_spending_approved": false,
   "runtime_preflight_enabled": false,
-  "pricing_confirmed_by_owner": false
+  "pricing_confirmed_by_owner": false,
+  "automatic_content_repair_enabled": false
 }

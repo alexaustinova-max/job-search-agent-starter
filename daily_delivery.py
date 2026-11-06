@@ -25,7 +25,6 @@ import pipeline as p
 DEFAULTS={'enabled':False,'delivery_approval':None,'recipient':None,'recipient_confirmed':False,
           'sender':None,'smtp_host':None,'smtp_port':465,'smtp_user':None,'tls':'implicit_ssl',
           'transport':'smtp','apps_script_url':None,'apps_script_test_confirmed':False}
-REPORT_RECIPIENT = None
 
 
 def secret_store(root=p.ROOT):
@@ -103,9 +102,9 @@ class AppsScriptRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req,fp,code,msg,headers,newurl)
 
 
-def apps_script_transport(message,day,url,token,*,test=False):
+def apps_script_transport(message,day,url,token,*,test=False,recipient=None):
     if not valid_apps_script_url(url):raise ValueError('apps_script_url_invalid')
-    if str(message['To'])!=REPORT_RECIPIENT:raise ValueError('apps_script_recipient_must_be_fixed')
+    if not address(recipient) or str(message['To'])!=recipient:raise ValueError('apps_script_recipient_must_be_fixed')
     attachment=list(message.iter_attachments())
     if len(attachment)!=1 or attachment[0].get_filename()!='digest.html':raise ValueError('archived_digest_required')
     raw=attachment[0].get_payload(decode=True);checksum=hashlib.sha256(raw).hexdigest()
@@ -121,7 +120,7 @@ def apps_script_transport(message,day,url,token,*,test=False):
     with opener.open(request,timeout=30) as response:
         result=json.loads(response.read(16384).decode('utf-8'))
     if (result.get('status')!='mailapp_accepted' or result.get('report_id')!=report_id
-            or result.get('recipient')!=REPORT_RECIPIENT or result.get('digest_sha256')!=checksum):
+            or result.get('recipient')!=recipient or result.get('digest_sha256')!=checksum):
         raise ValueError('apps_script_receipt_not_confirmed')
     return {'status':'mailapp_accepted','time':result.get('sent_at') or p.now(),
         'report_id':report_id,'digest_sha256':checksum}
@@ -137,7 +136,8 @@ def mail_content(report):
     text=[subject,f"Подтверждено в HH: {len(sent)}.",
         f"Новых вакансий: {counts.get('new_vacancies',0)}; проверено полных описаний: {counts.get('fresh_verified_vacancies',0)}; в подборке: {len(report.get('items',[]))}.",
         'Полный дневной отчет приложен: digest.html. Его можно скачать и открыть из письма.']
-    if report.get('status')!='completed':text.append('Цикл завершён не полностью: '+str(report.get('status'))+'.')
+    if report.get('scope')=='control':text.append('Контрольный запуск. Основной ежедневный цикл выполняется по вашему расписанию.')
+    elif report.get('status')!='completed':text.append('Цикл завершён не полностью: '+str(report.get('status'))+'.')
     html='<html lang="ru"><body style="font:16px/1.55 Arial,sans-serif;color:#192b40;max-width:950px;margin:auto"><h1>'+escape(subject)+'</h1>'+''.join('<p>'+escape(safe_text(s))+'</p>' for s in text[1:])
     text+=['','Подтвержденные отклики'];html+='<h2>Подтвержденные отклики</h2>'
     for item in sent.values():
@@ -148,7 +148,7 @@ def mail_content(report):
         if isinstance(body,dict):body=body.get('body','')
         text+=['',safe_text(title),url,'CV: '+str(profile)]
         html+='<h3><a href="'+escape(url,quote=True)+'">'+escape(safe_text(title))+'</a></h3><p>CV: '+escape(str(profile))+'</p>'
-        if body:
+        if body and not report.get('quality_review_markdown'):
             text+=['Письмо:',safe_text(body)]
             html+='<div style="white-space:pre-wrap;background:#f2f5fa;padding:15px">'+escape(safe_text(body))+'</div>'
         for answer in item.get('answers',[]):
@@ -171,6 +171,19 @@ def mail_content(report):
     usage=report.get('ai_usage',{});spent=usage.get('day',{});month=usage.get('month',{})
     line=f"OpenAI: {spent.get('calls',report.get('ai_calls',0))} вызовов; за день ${spent.get('actual_cost_usd',report.get('ai_cost_usd',0)):.6f}; с резервами ${spent.get('cost_usd',report.get('ai_cost_usd',0)):.6f}; за месяц ${month.get('actual_cost_usd',0):.6f}."
     text+=['',line];html+='<h2>Расход OpenAI</h2><p>'+escape(line)+'</p>'
+    if report.get('decision_funnel'):
+        funnel=report['decision_funnel'];line='Воронка: '+', '.join(str(k)+'='+str(v) for k,v in funnel.items())
+        text+=['',line];html+='<p>'+escape(line)+'</p>'
+    forecast=report.get('budget_forecast',{})
+    if forecast:
+        line='Остаток бюджета: $'+format(forecast.get('day_remaining_usd',0),'.6f')+' за сутки; $'+format(forecast.get('month_remaining_usd',0),'.6f')+' за месяц.'
+        text.append(line);html+='<p>'+escape(line)+'</p>'
+    if report.get('quality_review_markdown'):
+        # Deployed MailApp accepts exactly digest.html. The existing fallback is
+        # the full Markdown in both mail bodies; no deployment or extra service.
+        review=safe_text(report['quality_review_markdown'])
+        text+=['','Подробный отчет для ChatGPT · agent-quality-review.md',review]
+        html+='<h2>Подробный отчет для ChatGPT</h2><pre style="white-space:pre-wrap">'+escape(review)+'</pre>'
     for item in report.get('important_exceptions',[]):
         text.append(safe_text(item));html+='<p>'+escape(safe_text(item))+'</p>'
     return subject,'\n'.join(text)+'\n',html+'</body></html>'
@@ -249,14 +262,16 @@ def deliver(root,report,*,offline=False,one_test=False,apps_script_test=False):
         try:
             key=('daily:mail-apps-script-test:' if apps_script_test else 'daily:mail:')+report['date_moscow']
             protected=[key] if apps_script_test else [key,'daily:mail-test:'+report['date_moscow']]
-            if state.db.execute('SELECT 1 FROM meta WHERE key IN ('+','.join('?' for _ in protected)+')',protected).fetchone():
-                return {**result,'status':'previous_attempt_no_automatic_repeat'}
+            previous=state.db.execute('SELECT value FROM meta WHERE key IN ('+','.join('?' for _ in protected)+')',protected).fetchone()
+            if previous:
+                return {**result,'status':'previous_attempt_no_automatic_repeat',
+                    'previous_status':json.loads(previous['value']).get('status')}
             payload={'status':'attempt_reserved','fingerprint':fingerprint,'time':p.now(),'transport':channel}
             if channel=='apps_script':payload['deployment_hash']=p.digest(cfg['apps_script_url'])
             state.db.execute('INSERT INTO meta VALUES(?,?)',(key,json.dumps(payload)));state.db.commit()
             try:
                 if channel=='apps_script':
-                    payload.update(apps_script_transport(msg,report['date_moscow'],cfg['apps_script_url'],token,test=apps_script_test),delivery_confirmed=False)
+                    payload.update(apps_script_transport(msg,report['date_moscow'],cfg['apps_script_url'],token,test=apps_script_test,recipient=cfg['apps_script_recipient']),delivery_confirmed=False)
                 else:
                     receipt=p.smtp_transport(msg.as_bytes(policy=policy.SMTP),cfg['smtp_host'],cfg['smtp_port'],cfg['sender'],cfg['recipient'],user=cfg['smtp_user'],password=password,tls_context=tls_context())
                     payload.update(status='smtp_accepted',delivery_confirmed=False,time=receipt['smtp_accepted_at'],message_id=msg['Message-ID'])
@@ -275,7 +290,7 @@ def enable_apps_script(root,day,*,received=False):
         row=db.execute('SELECT value FROM meta WHERE key=?',('daily:mail-apps-script-test:'+day,)).fetchone()
     receipt=json.loads(row[0]) if row else {}
     if (receipt.get('status')!='mailapp_accepted' or receipt.get('deployment_hash')!=p.digest(cfg['apps_script_url'])
-            or cfg['recipient']!=REPORT_RECIPIENT or not cfg['delivery_approval']):
+            or cfg['recipient']!=cfg.get('apps_script_recipient') or not cfg['delivery_approval']):
         raise ValueError('successful_test_for_current_deployment_required')
     cfg.update(transport='apps_script',apps_script_test_confirmed=True,enabled=True)
     path=root/'delivery-config.json';path.write_text(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n');path.chmod(0o600)

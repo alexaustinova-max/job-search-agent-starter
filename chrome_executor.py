@@ -213,28 +213,34 @@ text:(document.body?.innerText||'').slice(0,22000),
 buttons:[...document.querySelectorAll('button,[role=button]')].filter(visible).map(e=>({...attrs(e),text:e.innerText,disabled:e.disabled||false,type:e.type||''})),
 links:[...document.querySelectorAll('a[href]')].filter(visible).map(e=>({...attrs(e),text:e.innerText,url:e.href})),
 fields:[...document.querySelectorAll('input,textarea,select')].filter(visible).map(e=>({...attrs(e),tag:e.tagName,type:e.type,
+max_length:Number.isInteger(e.maxLength)&&e.maxLength>=0?e.maxLength:null,
 label:label(e),question_prompt:['radio','checkbox'].includes(e.type)?groupPrompt(e):(label(e)||groupPrompt(e)),
 required:obligation(e),disabled:e.disabled||false,
 group_key:group(e)?'group:'+([...document.querySelectorAll('fieldset,[role=radiogroup],[role=group]')].indexOf(group(e))):e.name?'name:'+e.name:'',
 options:e.tagName==='SELECT'?[...e.options].map(o=>({text:o.label||o.text,value:o.value,disabled:o.disabled,selected:o.selected})):[],
 placeholder:e.placeholder||'',value:e.type==='password'?'':e.value,checked:e.checked}))};})())""")
 
+
     def review_form(self,tab_id,vacancy_id):
         """Reuse the existing extension's pure DOM reader/classifier over native Chrome.
 
         Only the transport changes; unknown notices/linked controls still block preparation.
         """
-        source=(p.ROOT/'browser/extension-form-review.mjs').read_text()
+        root=getattr(self,'root',p.ROOT)
+        source=(root/'browser/extension-form-review.mjs').read_text()
+        profiles=json.loads((root/'cv/current-cv-manifest.json').read_text()).get('profiles',{})
+        context={'vacancyId':vacancy_id,'resumeTitles':[cv['title_verified'] for cv in profiles.values() if cv.get('title_verified')]}
         functions=source[source.index('export function classifyForm('):source.index('export function layout(')]
         functions=functions.replace('export function ','function ')
         end=time.monotonic()+12;previous=None;since=None
         while True:
             stable_time=since is not None and time.monotonic()-since>=1.6
-            code='JSON.stringify((()=>{'+functions+'const sample=readFormDOM('+json.dumps(vacancy_id)+');const {ready,...meaningful}=sample;const signature=JSON.stringify(meaningful);const stable=signature==='+json.dumps(previous)+'&&'+json.dumps(stable_time)+';return {sample,signature,stable,review:classifyForm(sample,stable)};})())'
+            code='JSON.stringify((()=>{'+functions+'const sample=readFormDOM('+json.dumps(context)+');const {ready,...meaningful}=sample;const signature=JSON.stringify(meaningful);const stable=signature==='+json.dumps(previous)+'&&'+json.dumps(stable_time)+';return {sample,signature,stable,review:classifyForm(sample,stable)};})())'
             result=self.js(tab_id,code)
             if result['signature']!=previous:since=time.monotonic();previous=result['signature']
             if result['stable'] or time.monotonic()>=end:return result
             time.sleep(.35)
+
 
     @staticmethod
     def page_diagnostic(state,stage):
@@ -416,6 +422,7 @@ const e=a.parentElement?.parentElement?.parentElement;
 return {found:true,url:a.href,text:e?.innerText||a.innerText};})())""")
         return {'page_url':state['url'],**card}
 
+
     def inspect(self,item):
         vid=item['hh_id']
         if not vid.isdigit(): raise ValueError('invalid HH vacancy ID')
@@ -491,6 +498,7 @@ return {found:true,url:a.href,text:e?.innerText||a.innerText};})())""")
                                      'disabled':f.get('disabled',False)})
         questions.sort(key=lambda q:fields.index(q['field']))
         return questions
+
 
     @staticmethod
     def question_review(form,questions,answered_indices=()):
@@ -568,6 +576,7 @@ return {found:true,url:a.href,text:e?.innerText||a.innerText};})())""")
                 'reasons':question_issues+([] if same_questions else ['questions_changed_after_inspection']),
                 'submission_performed':False,'url':snapshot['url']}
 
+
     def field_js(self,field,value):
         # Target an observed field by exact UI identity. Native setter + input/change support React forms.
         return """JSON.stringify((()=>{const f="""+json.dumps(field,ensure_ascii=False)+", value="+json.dumps(value,ensure_ascii=False)+""";
@@ -592,9 +601,14 @@ return {ok:e.value===value&&(!e.validity||e.validity.valid)};})())"""
         if structural or result.get('status')=='needs_review' and not result.get('reasons'):
             return {**result,'form_filled':False}
         if self.state is not None:
-            confirmed_answers=resolve_form_questions(self.state,result['questions'],confirmed_answers,item['hh_id'],self.root,allow_ai=resolve_questions)
+            confirmed_answers=resolve_form_questions(self.state,result['questions'],confirmed_answers,item['hh_id'],self.root,allow_ai=resolve_questions,selected_cv=item['cv'])
         answers,unknown=standard_answers(result['questions'],confirmed_answers,item['hh_id'])
         if unknown:return {**result,'status':'needs_review','unknown_questions':unknown,
+                           # The question and controls were read; optionality is
+                           # still unknown, not an unread block. The resolver may
+                           # find sourced answers, then prepare()/readback must
+                           # validate them before any readiness or submit gate.
+                           'questions_checked':True,
                            'reasons':['unknown_questions_require_confirmed_answers'],'form_filled':False}
         pending=self.question_review(self.sessions[item['hh_id']]['form'],result['questions'],
             {a['question_index'] for a in answers})
@@ -628,6 +642,7 @@ return {selected:false,reason:'resume_choice_requires_explicit_mapping'};})())""
         session['inspection']=result;session['confirmed_answers']=confirmed_answers
         return self.checked_form(item,readback,confirmed_answers)
 
+
     def choice_js(self,question,values):
         return r'''JSON.stringify((()=>{const q='''+json.dumps(question,ensure_ascii=False)+', wanted='+json.dumps(values,ensure_ascii=False)+r''';
 const f=q.field;const all=[...document.querySelectorAll('input,select')];
@@ -646,6 +661,9 @@ return {ok:JSON.stringify([...e.selectedOptions].map(o=>o.value).sort())===JSON.
 
     def submit_once(self,item,answers):
         __import__('portable_runtime').require(self.root,'dispatch')
+        dispatch_path=self.root/'dispatch-config.json'
+        if dispatch_path.exists() and json.loads(dispatch_path.read_text()).get('paused'):
+            raise ValueError('all_application_submission_paused_by_user')
         if not self.supports_submission:raise ValueError('control_preparation_cannot_submit')
         session=self.sessions[item['hh_id']]
         if session.get('clicked'):raise ValueError('automatic_repeat_forbidden')
@@ -665,6 +683,11 @@ return {ok:JSON.stringify([...e.selectedOptions].map(o=>o.value).sort())===JSON.
             db.row_factory=sqlite3.Row
             check=readiness(SimpleNamespace(db=db),item,current,self.root)
         if not check['ready']:raise ValueError('needs_review: '+'; '.join(check['reasons']))
+        # Re-read the emergency stop after history/readback/quality checks, immediately
+        # before the only operation that can submit. A live batch may be paused mid-form.
+        __import__('portable_runtime').require(self.root,'dispatch')
+        if dispatch_path.exists() and json.loads(dispatch_path.read_text()).get('paused'):
+            raise ValueError('all_application_submission_paused_by_user')
         session['clicked']=True  # No retry even if transport fails while clicking.
         click=self.chrome.js(session['tab'],"""JSON.stringify((()=>{const b=[...document.querySelectorAll('[data-qa="vacancy-response-submit-popup"]')].filter(e=>e.getClientRects().length);if(b.length!==1||b[0].disabled||b[0].innerText.trim()!=='Откликнуться')return {clicked:false};b[0].click();return {clicked:true};})())""")
         if not click.get('clicked'):raise ValueError('submit_button_not_unambiguous; no_retry')
@@ -673,12 +696,16 @@ return {ok:JSON.stringify([...e.selectedOptions].map(o=>o.value).sort())===JSON.
         return {**session['prepared'],'post_click':{'url':state['url'],'text':state['text'][:10000],
                 'fields':state['fields'],'buttons':state['buttons']}}
 
+
     def verify_history(self,item,sent):
         history=self.history(item['hh_id'])
         if not history.get('found'):
-            # Preserve questions/test evidence, but never press a response button again.
-            raise ValueError('unconfirmed_send_or_followup_question: '+json.dumps(sent.get('post_click',{}),ensure_ascii=False))
+            # A mounted, hidden captcha button in the raw DOM is not an active
+            # protection challenge. guard() already checks the actual page after
+            # the click. Do not turn unrelated markup/field values into global
+            # stop codes or leak them into exception summaries. Never retry.
+            # Body text alone also cannot establish an active visibility error.
+            raise ValueError('unconfirmed_send_or_followup_question: history_missing')
         return {'vacancy_id':item['hh_id'],'resume_id':sent['resume_id'],
                 'letter_sha256':sent['letter_sha256'],'history_verified':True,
                 'evidence':history,'hh_status':history['text'],'verified_at':p.now()}
-

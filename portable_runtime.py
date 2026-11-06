@@ -114,6 +114,7 @@ def require(root, action):
             raise ValueError('AI_requires_own_key_reviewed_prices_and_explicit_budget')
     if action=='dispatch':
         dispatch=read(root,'dispatch-config.json')
+        if dispatch.get('paused'):raise ValueError('all_application_submission_paused_by_user')
         if not dispatch['enabled']:raise ValueError('dispatch_config_disabled')
         if type(dispatch['max_confirmed_per_day']) is not int or not 1<=dispatch['max_confirmed_per_day']<=cfg['max_applications_per_day']:
             raise ValueError('dispatch_limit_exceeds_portable_daily_limit')

@@ -3,6 +3,11 @@
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 
+function resumeContext(vacancyId) {
+  const manifest=JSON.parse(readFileSync(new URL('../cv/current-cv-manifest.json',import.meta.url),'utf8'));
+  return {vacancyId,resumeTitles:Object.values(manifest.profiles||{}).map(cv=>cv.title_verified).filter(Boolean)};
+}
+
 export function preparationReasons(request) {
   const item=request?.candidate;const approval=request?.preparation_approval;
   const reasons=[];
@@ -41,26 +46,41 @@ export async function verifyHhHistory(tab,ids) {
       text:e.closest('[data-qa="negotiations-item"]')?.innerText||e.innerText})).filter(e=>targets.includes(e.vacancy_id));
     return {scope:selected?.getAttribute('data-qa'),page:Number(document.querySelector('[data-qa*="number-pages-selected"]')?.innerText)||1,
       signature:links.map(e=>e.getAttribute('href')).join('|'),found:[...new Set(found)],pages,rows:rows.length,
+      has_next:!!document.querySelector('[data-qa="number-pages-next"]'),
       matches,
       link_count:links.length,expected_count:Number((selected?.innerText.match(/\d+/)||[])[0])||0,
       login:!!document.querySelector('input[type="password"]'),
       protection:/captcha|подтвердите, что вы не робот|доступ ограничен/i.test(document.body?.innerText||'')};
   },ids);
+  let precedingSignature=null;
+  const settled=async scope=>{
+    const end=Date.now()+7000;let last='',since=Date.now(),sample;
+    do{
+      sample=await read();if(sample.login||sample.protection)throw new Error('HH_history_unavailable');
+      const signature=JSON.stringify([sample.scope,sample.page,sample.signature,sample.pages,sample.rows,sample.expected_count]);
+      if(signature!==last){last=signature;since=Date.now();}
+      if(sample.scope===scope&&Date.now()-since>=500&&(precedingSignature===null||sample.signature!==precedingSignature||!sample.rows&&!sample.expected_count))return sample;
+      await new Promise(r=>setTimeout(r,150));
+    }while(Date.now()<end);
+    throw new Error('HH_history_scope_content_not_stable');
+  };
   for(const scope of ['tab_filter_all','tab_filter_archived','tab_filter_deleted']){
     await tab.playwright.locator('[data-qa="'+scope+'"]').waitFor({state:'visible',timeoutMs:7000});
     if(await tab.playwright.locator('[data-qa="'+scope+'"]').getAttribute('aria-selected')!=='true')
       await tab.playwright.locator('[data-qa="'+scope+'"]').click();
     await tab.playwright.locator('[data-qa="'+scope+'"][aria-selected="true"]').waitFor({state:'visible',timeoutMs:7000});
     await tab.playwright.domSnapshot();
-    let sample=await read();if(sample.login||sample.protection)throw new Error('HH_history_unavailable');
+    let sample=await settled(scope);
     const total=Math.max(1,...sample.pages);if(total>30)throw new Error('HH_history_exceeds_bounded_check');
     if(!sample.link_count&&(sample.expected_count||total>1))throw new Error('HH_history_rows_not_readable');
     const checkedPages=[];
     for(let page=1;page<=total;page++){
       if(page!==sample.page){
         const previous=sample.signature;
-        await tab.playwright.locator('[data-qa^="number-pages-'+page+' "]').click();
-        await tab.playwright.locator('[data-qa^="number-pages-'+page+' "][data-qa*="number-pages-selected"]').waitFor({state:'visible',timeoutMs:7000});
+        const control=sample.pages.includes(page)?'[data-qa~="number-pages-'+page+'"]':page===sample.page+1&&sample.has_next?'[data-qa="number-pages-next"]':null;
+        if(!control)throw new Error('HH_history_page_control_not_rendered: '+page);
+        await tab.playwright.locator(control).click();
+        await tab.playwright.locator('[data-qa~="number-pages-'+page+'"][data-qa~="number-pages-selected"]').waitFor({state:'visible',timeoutMs:7000});
         const end=Date.now()+5000;
         do{sample=await read();if(sample.signature!==previous)break;await new Promise(r=>setTimeout(r,200));}while(Date.now()<end);
         if(sample.signature===previous)throw new Error('HH_history_content_not_updated');
@@ -69,6 +89,7 @@ export async function verifyHhHistory(tab,ids) {
       result.found.push(...sample.found);result.matches.push(...sample.matches.map(m=>({...m,scope,page})));checkedPages.push(page);
     }
     result.scopes.push({scope,pages:checkedPages});
+    precedingSignature=sample.signature;
   }
   result.found=[...new Set(result.found)];result.checked=true;result.checked_at=new Date().toISOString();
   return result;
@@ -82,15 +103,17 @@ export async function fillApprovedFields(tab,request,review,history) {
     throw new Error('HH_history_scope_incomplete');
   if(review.status!=='inspected'||review.questions_state!=='absence_confirmed')throw new Error('questions_require_confirmed_answers');
   // First supported preparation deliberately handles only reliably question-free forms.
-  const before=await tab.playwright.evaluate(readFormDOM,item.hh_id);
+  const before=await tab.playwright.evaluate(readFormDOM,resumeContext(item.hh_id));
   if(classifyForm(before,true).questions_state!=='absence_confirmed')throw new Error('questions_changed_before_fill');
   const radios=tab.playwright.getByRole('radio',{name:item.hh_resume_title,exact:true});
   if(await radios.count()!==1){
-    const currentTitle=await tab.playwright.evaluate(()=>{
+    const titles=Object.values(JSON.parse(readFileSync(new URL('../cv/current-cv-manifest.json',import.meta.url),'utf8')).profiles)
+      .map(cv=>cv.title_verified).filter(Boolean);
+    const currentTitle=await tab.playwright.evaluate(titles=>{
       const matches=[...document.querySelectorAll('button,[role="button"]')].map(e=>(e.innerText||'').trim())
-        .filter(t=>/Head of Research|Product Lead|Head of CX Research/.test(t));
+        .filter(t=>titles.includes(t));
       return matches.length===1?matches[0]:null;
-    });
+    },titles);
     if(!currentTitle)throw new Error('resume_chooser_not_unambiguous');
     await tab.playwright.getByRole('button',{name:currentTitle,exact:true}).click();
   }
@@ -108,7 +131,7 @@ export async function fillApprovedFields(tab,request,review,history) {
     return choices.length===1;
   },{id:item.hh_resume_id,title:item.hh_resume_title});
   if(!cv)throw new Error('selected_HH_resume_readback_failed');
-  const after=await tab.playwright.evaluate(readFormDOM,item.hh_id);
+  const after=await tab.playwright.evaluate(readFormDOM,resumeContext(item.hh_id));
   if(classifyForm(after,true).questions_state!=='absence_confirmed')throw new Error('questions_changed_after_fill');
   return {form_filled:true,cv_verified:true,resume_id:item.hh_resume_id,cv_sha256:item.cv.sha256,
     hh_cv_version:item.cv.hh_version,
@@ -133,7 +156,11 @@ export function classifyForm(sample, stable) {
   let state = found.length ? 'detected' : 'unknown';
   if (!found.length && sample.questions_heading) reasons.push('question_heading_without_readable_fields');
   // Placement outside FORM and lack of an ARIA target do not establish what HH means.
-  if (!found.length && sample.notice?.questions)
+  if (!found.length && sample.question_view?.state==='present') reasons.push('active_questionnaire_without_readable_fields');
+  const emptyView=sample.question_view?.state==='absent_confirmed'
+    &&sample.question_view?.factory_shape_verified===true
+    &&sample.question_view?.source==='active_HH_questionnaire_renderer';
+  if (!found.length && sample.notice?.questions && !emptyView)
     reasons.push(sample.notice.visible===true?'employer_questions_announced_but_unreadable':'question_notice_meaning_not_confirmed');
   if (!reasons.length && !found.length) state = 'absence_confirmed';
   return {questions_state:state, questions_absence_confirmed:state==='absence_confirmed',
@@ -141,7 +168,9 @@ export function classifyForm(sample, stable) {
     reasons:[...new Set(reasons)], questions:found, submission_allowed:false};
 }
 
-export function readFormDOM(vacancyId) {
+export function readFormDOM(context) {
+  const vacancyId=typeof context==='object'?context.vacancyId:context;
+  const resumeTitles=typeof context==='object'&&Array.isArray(context.resumeTitles)?context.resumeTitles:[];
   const norm=s=>(s||'').replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/\s+/g,' ').trim();
   const visible=e=>{
     if(!e.getClientRects().length)return false;
@@ -229,6 +258,9 @@ export function readFormDOM(vacancyId) {
   const closed=roots.flatMap(r=>[...r.querySelectorAll('details:not([open]),[aria-expanded="false"]')]);
   const frames=roots.flatMap(r=>[...r.querySelectorAll('iframe')]);
   const questionControls=[...document.querySelectorAll('button,[role="button"],summary,a,[aria-controls]')].filter(e=>{
+    // Observed HH alternate submit action, not a questionnaire expander.
+    // Never click it; all actual questions remain subject to answer validation.
+    if(e.getAttribute('data-qa')==='vacancy-response-link-no-questions')return false;
     const words=/вопрос|анкет|question|survey/i.test(norm(e.textContent)+' '+(e.getAttribute('data-qa')||''));
     const linked=(e.getAttribute('aria-controls')||'').split(/\s+/).some(id=>{
       const target=document.getElementById(id);return target&&(target===form||form?.contains(target));
@@ -239,6 +271,28 @@ export function readFormDOM(vacancyId) {
   const buttons=[...(form||document).querySelectorAll('button,[role="button"]')];
   let hash=0;for(const c of norm(form?.textContent))hash=(Math.imul(hash,31)+c.charCodeAt(0))|0;
   const noticeText=norm(notice?.textContent);
+  // HH's observed page template always prints vacancy.response.page.description.
+  // Inspect only its already-loaded, pure conditional view factory, NEVER submit,
+  // event handlers, Redux actions, network or candidate values. A changed factory
+  // shape fails closed. Its empty branch is evidence in addition to DOM coverage.
+  let questionView={state:'unknown',source:'active_HH_questionnaire_renderer'};
+  const fiberKey=form&&Object.keys(form).find(k=>k.startsWith('__reactFiber$'));
+  let fiber=fiberKey?form[fiberKey]:null;
+  const pureQuestionView=/^\(\)=>[$\w]+&&\(0,[$\w]+\.jsx\)\([$\w]+,\{test:[$\w]+,vacancyId:[$\w]+\}\)$/;
+  for(let depth=0;fiber&&depth<24;depth++,fiber=fiber.return){
+    const props=fiber.memoizedProps;
+    if(String(props?.vacancyId)!==String(vacancyId)||typeof props?.renderContent!=='function')continue;
+    const source=String(props.renderContent);
+    if(!pureQuestionView.test(source))break;
+    try{
+      const view=props.renderContent();
+      if(view===undefined||view===null||view===false)
+        questionView={state:'absent_confirmed',source:'active_HH_questionnaire_renderer',factory_shape_verified:true};
+      else if(view&&typeof view==='object'&&view.props?.test)
+        questionView={state:'present',source:'active_HH_questionnaire_renderer',factory_shape_verified:true};
+    }catch(_){} // Unknown is never no questions.
+    break;
+  }
   const visibilityWarnings=form?[...form.querySelectorAll('[data-qa="hidden-resume-warning"]')]:[];
   const locationURL=new URL(location.href);
   return {url:locationURL.origin+locationURL.pathname+'?vacancyId='+vacancyId,
@@ -246,8 +300,8 @@ export function readFormDOM(vacancyId) {
       locationURL.searchParams.get('vacancyId')===vacancyId&&/(^|\.)hh\.ru$/.test(locationURL.hostname),
     form:!!form&&visible(form), cover_letter:allFields.some(f=>f.cover_letter&&f.visible),
     submit_control:buttons.some(e=>visible(e)&&norm(e.textContent)==='Откликнуться'),
-    resume_control:buttons.some(e=>visible(e)&&/Head of Research|Product Lead|Head of CX Research/.test(norm(e.textContent)))||allFields.some(f=>f.cv_choice),
-    fields:allFields, questions, coverage_complete:!!form&&!custom.length&&!frames.length&&questions.every(q=>q.prompt),
+    resume_control:buttons.some(e=>visible(e)&&resumeTitles.includes(norm(e.textContent)))||allFields.some(f=>f.cv_choice),
+    question_view:questionView,fields:allFields, questions, coverage_complete:!!form&&!custom.length&&!frames.length&&questions.every(q=>q.prompt),
     custom_controls:custom.map(desc),frames:frames.map(desc),closed_sections:closed.map(desc),question_controls:questionControls.map(desc),
     busy:roots.some(r=>r.querySelector('[aria-busy="true"],[role="progressbar"]')),
     questions_heading:/Ответьте на вопросы/i.test(body),
@@ -299,7 +353,7 @@ export async function reviewForm(browser,{vacancyId=null,maxWaitMs=12000,stableF
     await ownTab.goto('https://hh.ru/applicant/vacancy_response?vacancyId='+vacancyId);
     const started=Date.now();let previous=null,stableSince=null,sample=null,stable=false,samples=0;
     while(Date.now()-started<=maxWaitMs){
-      sample=await ownTab.playwright.evaluate(readFormDOM,vacancyId);samples++;
+      sample=await ownTab.playwright.evaluate(readFormDOM,resumeContext(vacancyId));samples++;
       if(sample.protection||sample.login_required)break;
       // readyState is diagnostic only; stability covers anchors, fields, notices and controls.
       const {ready,...meaningful}=sample;const signature=JSON.stringify(meaningful);

@@ -188,7 +188,7 @@ def render_schedule(root=ROOT):
     label='local.job-search-agent.starter.'+rt.identity(root)[:12]
     hour,minute=map(int,cfg['daily_time'].split(':'))
     system_zone=datetime.now().astimezone().tzinfo
-    value={'Label':label,'ProgramArguments':[str(Path(sys.executable).resolve()),str(Path(root).resolve()/'portable.py'),'daily'],
+    value={'Label':label,'ProgramArguments':[str(Path(sys.executable).resolve()),str(Path(root).resolve()/'portable.py'),'daily','--trigger','launchd'],
         'WorkingDirectory':str(Path(root).resolve()),'StartCalendarInterval':{'Hour':hour,'Minute':minute},
         'RunAtLoad':False,'StandardOutPath':str(Path(root).resolve()/'var/schedule.stdout.log'),
         'StandardErrorPath':str(Path(root).resolve()/'var/schedule.stderr.log')}
@@ -203,7 +203,8 @@ def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='command',required=True)
-    for name in ['init','doctor','demo','validate','search','daily','render-schedule']:sub.add_parser(name)
+    for name in ['init','doctor','demo','validate','search','render-schedule']:sub.add_parser(name)
+    daily_parser=sub.add_parser('daily');daily_parser.add_argument('--trigger',choices=['manual','launchd'],default='manual');daily_parser.add_argument('--force',action='store_true');daily_parser.add_argument('--resume-questions',action='store_true')
     acceptance=sub.add_parser('accept-dispatch-policy');acceptance.add_argument('--acknowledge-reviewed',action='store_true',required=True)
     sub.add_parser('pause')
     sync=sub.add_parser('sync-resume');sync.add_argument('profile');sync.add_argument('resume_id')
@@ -239,9 +240,8 @@ def main():
         result=p.summary(p.run(rt.validate_profile(),root=ROOT))
     else:
         rt.require(ROOT,'hh');import daily_run as daily
-        report=daily.run(ROOT)
-        if report['status']=='blocked':raise ValueError('daily_run_blocked_check_var_daily_digest')
-        result=daily.finish_daily(ROOT,report)
+        result=daily.execute_daily(ROOT,trigger=args.trigger,force=args.force,resume_questions_only=args.resume_questions)
+        if result.get('status') in ('retryable_failure','blocked'):raise ValueError('daily_cycle_stopped_check_local_report')
     print(json.dumps(result,ensure_ascii=False,indent=2));return 0
 
 

@@ -1,7 +1,8 @@
 {
   "enabled": false,
   "max_confirmed_per_day": 5,
-  "quality_policy": "evidence-factual-policy-v2",
+  "quality_policy": "complete-letter-evidence-policy-v5",
   "require_control_e2e": true,
-  "control_send_limit": 1
+  "control_send_limit": 1,
+  "paused": false
 }

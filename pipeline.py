@@ -27,7 +27,7 @@ import hh_api
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '4.4.1'
+VERSION = '4.5.0-portable'
 STAGES = {'found': 'найдена', 'checked': 'проверена', 'matched': 'соответствует',
           'prepared': 'подготовлена', 'approved': 'согласована', 'sent': 'отправлена',
           'confirmed': 'подтверждена'}
@@ -96,9 +96,13 @@ def load_candidate(candidate, root):
 
 
 REQUIRED_HEADING = r"(?:обязательные |желательные )?требования(?: к кандидатам)?|обязательный опыт|ключевые (?:компетенции|hard skills)|какие (?:навыки пригодятся|знания и навыки важны)|наши ожидания от кандидата|что для нас важно|мы ожидаем|наш идеальный кандидат|requirements?|qualifications?|skills (?:and|&) qualifications|what (?:you(?:'|’)ll bring|we(?:'|’)re looking for)|требования|что (?:мы )?ожидаем|необходимые навыки(?: и знания)?|требования к (?:кандидат[ау]|опыту работы)|наши (?:ожидания|требования|пожелания(?: к кандидатам)?)|(?:для нас|нам) важно|мы (?:ждем|ждём) от (?:тебя|вас)|кого мы ищем|что (?:важно(?: для этой роли)?|потребуется)|важные для нас навыки и опыт|мы ищем человека, который|что для этого нужно"
+REQUIRED_HEADING += r'|мы (?:ждем|ждём),? что у вас(?: есть)?'
 REQUIREMENT_VERSION = 'sections-v2'
 REQUIRED_HEADING += r'|мы (?:ждем|ждём),? что у вас(?: есть)?'
 OPTIONAL_MARKER = r'nice[ -]to[ -]have|(?:a (?:big |significant )?|significant )plus|preferred|prefer candidates|bonus(?: points)?|desirable|ideally|advantage|beneficial|преимуществ|плюсом|желательно'
+OPTIONAL_MARKER += r'|будет здорово'
+OPTIONAL_MARKER += r'|предпочтительно'
+OPTIONAL_MARKER += r'|желателен|желательна|желательны|приветствуется'
 OPTIONAL_MARKER += r'|будет здорово'
 OPTIONAL_HEADING = r'(?:будет|будут) (?:(?:большим|большими|дополнительным|дополнительными) )?(?:плюсом|плюсами|преимуществом|преимуществами)|желательные требования(?: к кандидатам)?|'+OPTIONAL_MARKER
 REQUIRED_MARKER = r'\bmust\b|\brequired\b|mandatory|обязатель|необходим|требуется|должны'
@@ -131,7 +135,7 @@ def description_lines(text):
             line = parts[1].strip()
         if section == 'excluded': continue
         # Do not let "We prefer..." erase earlier mandatory sentences in a bullet.
-        chunks = re.split(r'(?<=[.!?])\s+(?=(?:It is (?:a |an |a significant )?(?:plus|advantage)|We prefer|Familiarity with[^.]*\bplus\b|Nice.to.have|Будет плюсом))', line, flags=re.I)
+        chunks = re.split(r'(?<=[.!?;])\s+(?=(?:It is (?:a |an |a significant )?(?:plus|advantage)|We prefer|Familiarity with[^.]*\bplus\b|Nice.to.have|Будет плюсом|предпочтительно|желательно))', line, flags=re.I)
         expanded = []
         for chunk in chunks:
             expanded.extend(re.split(r',\s*(?=ideally\b)', chunk, flags=re.I))
@@ -337,7 +341,7 @@ def gross_salary_assessment(job, floor):
     salary=job.get('salary') or {};bands=salary.get('ranges',[salary]) if salary else []
     text=job.get('description','');fixed=[]
     number=r'(\d[\d \u00a0\u202f]*(?:[.,]\d+)?)'
-    pattern=r'(?:оклад|фикс(?:ированн\w*(?:\s+(?:часть|доход|зарплат\w*))?)?)\s*[:=—-]?\s*(от\s+|до\s+)?'+number+r'\s*(?:[-–—]\s*'+number+r')?\s*(тыс\.?|тысяч|[kк])?'
+    pattern=r'(?:оклад|зарплата|заработная\s+плата|salary|compensation|фикс(?:ированн\w*(?:\s+(?:часть|доход|зарплат\w*))?)?)\s*[:=—-]?\s*(от\s+|до\s+)?'+number+r'\s*(?:[-–—]\s*'+number+r')?\s*(тыс\.?|тысяч|[kк])?'
     for line in text.splitlines():
         match=re.search(pattern,line,re.I)
         if not match:continue
@@ -354,7 +358,8 @@ def gross_salary_assessment(job, floor):
     if fixed:bands=fixed
     elif package and bands:
         result.update(note='fixed_part_not_disclosed',dispatch_blocker='fixed_part_not_disclosed')
-        return result
+        # The published TOTAL ceiling is still an upper bound on fixed pay.
+        # Keep it for rejection, never use it to confirm a sufficient fixed part.
     for band in bands:
         item={'currency':band.get('currency'),'gross':band.get('gross'),
             'published_interval':band.get('interval'),'monthly_published_min':None,'monthly_published_max':None,
@@ -374,6 +379,8 @@ def gross_salary_assessment(job, floor):
                 definitely_below_floor=high is not None and high<floor,
                 confirmed_min_meets_floor=low is not None and low>=floor)
         elif band.get('gross') is False:item.update(net_min=low,net_max=high)
+    if result.get('dispatch_blocker')=='fixed_part_not_disclosed':
+        for band in result['bands']:band['confirmed_min_meets_floor']=False
     if result['bands'] and all(b['definitely_below_floor'] for b in result['bands']):
         result.update(status='below_gross_floor',failure='salary_below_floor',note='published_fixed_GROSS_below_floor')
     elif any(b['confirmed_min_meets_floor'] for b in result['bands']):
@@ -388,77 +395,44 @@ def gross_salary_assessment(job, floor):
 def salary_assessment(job, floor, basis='NET'):
     if basis=='GROSS':return gross_salary_assessment(job,floor)
     if basis!='NET':raise ValueError('unsupported_salary_floor_basis')
-    result = {'floor_monthly_rub': floor, 'floor_basis': 'NET', 'status': 'unknown',
-              'failure': None, 'needs_review': True, 'net_floor_confirmed': False,
-              'note': 'salary_not_disclosed_or_not_parseable', 'bands': []}
-    salary = job.get('salary')
-    if not salary:
-        bands = []
-        for line in job.get('description', '').splitlines():
-            if not re.search(r'salary|compensation|зарплат|оклад|оплат', line, re.I): continue
-            period = 'month' if re.search(r'month|месяц|/мес', line, re.I) else 'year' if re.search(r'annual|year|в год|/год', line, re.I) else None
-            if not period: continue
-            match = re.search(r'(\d[\d ]*(?:[.,]\d+)?)\s*(?:-|–|—|до|to)\s*(\d[\d ]*(?:[.,]\d+)?)\s*(тыс\.?|[kк])?\s*(?:₽|руб|RUB|RUR)', line, re.I)
-            if not match: continue
-            factor = 1000 if match[3] else 1
-            gross = True if re.search(r'\bgross\b|до вычета|до уплаты|до налог', line, re.I) else False if re.search(r'\bnet\b|на руки|после вычета|после уплаты', line, re.I) else None
-            bands.append({'min': float(match[1].replace(' ', '').replace(',', '.')) * factor,
-                          'max': float(match[2].replace(' ', '').replace(',', '.')) * factor,
-                          'currency': 'RUB', 'interval': period, 'gross': gross,
-                          'evidence': line})
-        if not bands: return result
-    else: bands = salary.get('ranges', [salary])
-    if not bands: return result
-    for band in bands:
-        currency = (band.get('currency') or '').upper()
-        period = str(band.get('interval') or '').lower()
-        factor = 12 if 'year' in period or 'год' in period else 1 if 'month' in period or 'месяц' in period else None
-        item = {'currency': currency, 'gross': band.get('gross'), 'published_interval': period,
-                'monthly_published_min': None, 'monthly_published_max': None,
-                'net_min': None, 'net_max': None, 'net_estimate_min': None, 'net_estimate_max': None,
-                'definitely_below_floor': False, 'confirmed_min_meets_floor': False}
+    # Reuse the fixed-pay parser. This branch does NOT use its GROSS decision or
+    # an assumed tax residence/rate. NET cannot exceed a stated RUB pay ceiling.
+    parsed=gross_salary_assessment(job,floor)
+    result={'floor_monthly_rub':floor,'floor_basis':'NET','status':'unknown',
+        'failure':None,'needs_review':False,'net_floor_confirmed':False,
+        'note':'salary_not_disclosed_or_not_parseable','bands':[]}
+    for band in parsed['bands']:
+        item={**band,'net_estimate_min':None,'net_estimate_max':None}
+        low,high=item['monthly_published_min'],item['monthly_published_max']
+        comparable=(str(item.get('currency') or '').upper() in {'RUB','RUR','РУБ'}
+                    and (low is not None or high is not None)
+                    and not (low is not None and high is not None and low>high))
+        item['definitely_below_floor']=bool(comparable and high is not None and (high<floor or (item['gross'] is True and high==floor)))
+        item['confirmed_min_meets_floor']=bool(comparable and item['gross'] is False
+                                                and low is not None and low>=floor)
+        if not comparable:item['unknown_reason']='salary_currency_period_or_range_unknown'
+        elif item['gross'] is None:item['unknown_reason']='salary_tax_basis_unknown'
         result['bands'].append(item)
-        if currency not in {'RUB', 'RUR', 'РУБ'}:
-            item['unknown_reason'] = 'foreign_salary_no_verified_fx'; continue
-        if factor is None:
-            item['unknown_reason'] = 'salary_period_not_comparable'; continue
-        for field in ('min', 'max'):
-            value = band.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
-                item['monthly_published_' + field] = value / factor
-        low, high = item['monthly_published_min'], item['monthly_published_max']
-        if low is not None and high is not None and low > high:
-            item['unknown_reason'] = 'invalid_salary_range'; continue
-        if band.get('gross') is False:
-            item.update(net_min=low, net_max=high)
-            item['confirmed_min_meets_floor'] = low is not None and low >= floor
-            item['definitely_below_floor'] = high is not None and high < floor
-        elif band.get('gross') is True:
-            item.update(net_estimate_min=estimated_monthly_net(low) if low else None,
-                        net_estimate_max=estimated_monthly_net(high) if high else None,
-                        tax_model=TAX_MODEL, tax_source=TAX_SOURCE,
-                        assumptions=['Russian tax resident, ordinary employment wages',
-                                     '12 equal monthly payments, no deductions, bonuses or other income',
-                                     'Annual average, not a guaranteed amount for each month'])
-            # Even before deductions a ceiling below NET floor cannot meet it.
-            item['definitely_below_floor'] = high is not None and high < floor
-        else:
-            item['unknown_reason'] = 'salary_tax_basis_unknown'
-            item['definitely_below_floor'] = high is not None and high < floor
-    bands = result['bands']
-    if all(b['definitely_below_floor'] for b in bands):
-        result.update(status='below_net_floor', failure='salary_below_floor', needs_review=False,
-                      note='published_ceiling_below_net_floor_rub')
+    # A stated total package cannot prove the fixed part meets the floor. Its
+    # absence/uncertainty is a risk, not an invented salary or an automatic REVIEW.
+    package_unknown=parsed.get('dispatch_blocker')=='fixed_part_not_disclosed'
+    if package_unknown:
+        result['note']='fixed_part_not_disclosed_bonus_not_counted'
+        for band in result['bands']:band['confirmed_min_meets_floor']=False
+    bands=result['bands']
+    if bands and all(b['definitely_below_floor'] for b in bands):
+        result.update(status='below_net_floor',failure='salary_below_floor',
+                      note='published_fixed_ceiling_below_NET_floor_without_tax_assumptions')
+    elif package_unknown:
+        pass
     elif any(b['confirmed_min_meets_floor'] for b in bands):
-        result.update(status='net_floor_met', needs_review=False, net_floor_confirmed=True, note='published_net_min_meets_floor_rub')
-    elif all(b['net_estimate_max'] is not None and b['net_estimate_max'] < floor for b in bands):
-        result.update(status='estimated_below_net_floor', note='salary_net_below_floor_estimate')
-    elif any(b['gross'] is True and b.get('tax_model') for b in bands):
-        result.update(status='gross_requires_net_confirmation', note='salary_gross_requires_net_confirmation')
-    elif all(b['net_max'] is not None for b in bands):
-        result.update(status='net_range_requires_negotiation', note='salary_net_range_requires_negotiation')
-    else:
-        result['note'] = next((b['unknown_reason'] for b in bands if b.get('unknown_reason')), 'salary_ceiling_not_published')
+        result.update(status='net_floor_met',net_floor_confirmed=True,
+                      note='published_net_min_meets_floor_rub')
+    elif any(b['gross'] is True for b in bands):
+        result.update(status='gross_not_converted_to_net',note='GROSS_kept_without_unapproved_tax_conversion')
+    elif any(b['gross'] is False for b in bands):
+        result.update(status='net_range_requires_negotiation',note='salary_net_range_requires_negotiation')
+    elif bands:result['note']=next((b['unknown_reason'] for b in bands if b.get('unknown_reason')),'salary_ceiling_not_published')
     return result
 
 

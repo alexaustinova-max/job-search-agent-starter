@@ -241,7 +241,7 @@ class PortableTests(unittest.TestCase):
             result=cli.render_schedule(self.root)
         self.assertFalse(result['installed'])
         plist=plistlib.loads(Path(result['rendered']).read_bytes())
-        self.assertFalse(plist['RunAtLoad']);self.assertEqual(plist['ProgramArguments'][-1],'daily')
+        self.assertFalse(plist['RunAtLoad']);self.assertEqual(plist['ProgramArguments'][-3:],['daily','--trigger','launchd'])
         self.assertEqual(plist['WorkingDirectory'],str(self.root.resolve()))
 
     def test_network_guard_actually_blocks_sockets(self):
